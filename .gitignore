@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Compiled CUDA binaries
+cuda_kernels/matmul
+cuda_kernels/softmax
+cuda_kernels/*.o
+
+# Triton JIT cache
+~/.triton/
+.triton/
+
+# Benchmark output
+benchmark_results.json
+benchmark_results.txt
+*.nsys-rep
+*.ncu-rep
+*.nvvp
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / env
+.env
