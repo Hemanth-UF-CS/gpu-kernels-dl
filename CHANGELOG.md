@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- `results/rtx3090_20260521.txt` did not match what the benchmarks produce on an RTX 3090
+  (e.g. cuBLAS reaches 67 TFLOPS at N = 4096, not 40). Removed it. The benchmarks now write
+  JSON with GPU and version metadata, and the README tables come from that output.
+- Triton matmul: autotune tile, pipeline and warp configs. At N = 4096 it went from
+  10.6 to 69.3 TFLOPS on an RTX 3090.
+- CUDA softmax: both kernels reduced only within one warp of a 256-thread block. They now use
+  block-wide reductions and are checked against a CPU reference.
+- `cuda_kernels/matmul.cu` did not compile (missing `<functional>`). `ARCH` can now be set
+  on the make command line.
+- `test_sum_fp16_no_overflow` expected a sum (524,288) that fp16 cannot represent. It now
+  checks fp32 accumulation with a sum fp16 can hold.
+
 ## [1.2.0] — 2026-05-21
 
 ### Added

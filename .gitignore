@@ -35,3 +35,7 @@ Thumbs.db
 
 # Secrets / env
 .env
+
+# Compiled CUDA binaries
+cuda_kernels/matmul
+cuda_kernels/softmax

@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (CPU torch; GPU tests skip without CUDA)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install triton pytest
+      - run: pytest -q
+
+  cuda-build:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.2.2-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update -qq && apt-get install -y -qq make
+      - name: Compile CUDA kernels
+        run: make -C cuda_kernels ARCH=sm_86

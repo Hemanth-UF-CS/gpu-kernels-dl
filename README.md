@@ -1,142 +1,81 @@
-# Custom GPU Kernels for Deep Learning Primitives
+# gpu-kernels-dl
 
-Custom GPU kernels for tiled matrix multiplication, row-wise softmax, and parallel
-reduction — implemented in both **Triton** and **CUDA C++**, validated against PyTorch
-baselines, and benchmarked with CUDA events.
+Matrix multiply, row-wise softmax and parallel reduction written as GPU kernels in Triton and
+CUDA C++, each checked against PyTorch or a CPU reference and benchmarked with CUDA events.
 
-Built to understand what vendor-optimized libraries actually do that a clean
-educational kernel does not.
+## Results (RTX 3090)
+
+torch 2.5.1+cu121, Triton 3.1.0, CUDA 12.1. Raw numbers are in
+[`results/`](results/), written by the benchmark scripts.
+
+**Matmul, fp16 in, fp32 accumulate (TFLOPS, higher is better)**
+
+| N (N x N x N) | cuBLAS (`torch.matmul`) | Triton | Triton / cuBLAS |
+|---:|---:|---:|---:|
+| 256 | 4.8 | 1.0 | 0.21x |
+| 512 | 32.7 | 7.9 | 0.24x |
+| 1024 | 55.4 | 54.3 | 0.98x |
+| 2048 | 67.6 | 64.3 | 0.95x |
+| 4096 | 66.3 | 69.3 | 1.05x |
+
+From N = 1024 up, the Triton kernel matches cuBLAS (0.95x to 1.05x). Below that the problem
+is a few microseconds of GPU work, and the Python-side launch of a Triton kernel (about 30 us)
+dominates.
+
+**Softmax, fp32 (effective GB/s, one read and one write of the tensor)**
+
+| Shape | `torch.softmax` | Triton | Triton / PyTorch |
+|---:|---:|---:|---:|
+| 512 x 512 | 491 | 130 | 0.26x |
+| 1024 x 1024 | 690 | 513 | 0.74x |
+| 2048 x 2048 | 580 | 806 | 1.39x |
+| 4096 x 4096 | 825 | 833 | 1.01x |
+| 8192 x 4096 | 825 | 838 | 1.02x |
+
+Softmax is bandwidth-bound. For rows of 2048 columns and wider, the Triton kernel reaches
+about 830 GB/s, close to the card's 936 GB/s, and matches or beats PyTorch. Small tensors are
+again dominated by launch overhead.
 
 ## Kernels
 
-| Kernel | Triton | CUDA C++ | What it demonstrates |
-|--------|--------|----------|----------------------|
-| Matrix multiply | `triton_kernels/matmul.py` | `cuda_kernels/matmul.cu` | Shared-memory tiling, L2-swizzled program order, `tl.dot` vs naive loop |
-| Row-wise softmax | `triton_kernels/softmax.py` | `cuda_kernels/softmax.cu` | Numerically-stable fused softmax, warp `__shfl_xor_sync` reductions |
-| Reduction (sum/max/mean) | `triton_kernels/reduction.py` | — | Two-phase parallel reduction, shared-memory tree reduce |
+| Kernel | Triton | CUDA C++ | Technique |
+|---|---|---|---|
+| Matmul | `triton_kernels/matmul.py` | `cuda_kernels/matmul.cu` | Blocked GEMM with `tl.dot` (tensor cores), L2-friendly grouped launch order, autotuned tile, pipeline and warp configs. The CUDA version is a 32x32 shared-memory tiled fp32 kernel next to a naive one. |
+| Softmax | `triton_kernels/softmax.py` | `cuda_kernels/softmax.cu` | One program per row. Triton keeps the row in registers (one read, one write). CUDA uses block-wide max and sum reductions with warp shuffles. |
+| Reduction | `triton_kernels/reduction.py` | | Two-phase sum, max and mean. Partial results are always fp32, so fp16 inputs keep precision. |
 
-## Quick start
-
-### Triton kernels
+## Run
 
 ```bash
 pip install -r requirements.txt
+pytest -q                                        # 20 tests, skipped without a GPU
 
-# Validate correctness
-python triton_kernels/matmul.py
-python triton_kernels/softmax.py
-python triton_kernels/reduction.py
+python benchmarks/bench_matmul.py --out results/matmul.json
+python benchmarks/bench_softmax.py --out results/softmax.json
 
-# Benchmark vs PyTorch
-python benchmarks/bench_matmul.py
-python benchmarks/bench_softmax.py
+cd cuda_kernels && make ARCH=sm_86               # sm_89 for RTX 40xx, sm_80 for A100
+./matmul 333 517 129                             # checked against a CPU reference
+./softmax 4096 4096                              # checked against a CPU reference
 ```
 
-### CUDA C++ kernels
+## Notes
 
-```bash
-cd cuda_kernels
-# Edit ARCH= in Makefile to match your GPU (sm_80=A100, sm_86=RTX 30xx, sm_89=RTX 40xx)
-make
-
-./matmul 1024 1024 1024
-./softmax 4096 4096
-```
-
-## Benchmark results
-
-Measured on **RTX 3090** (24 GB, 35.6 TFLOPS fp16 TC, 936 GB/s), PyTorch 2.3.0,
-Triton 2.3.0.  50 iterations after 5 warmup, CUDA event timing.
-
-### Matrix multiplication — fp16, TFLOPS
-
-| Size   | torch.matmul | Triton kernel | Triton / cuBLAS |
-|--------|-------------|---------------|-----------------|
-| 256    | 0.73        | 0.40          | 0.55×           |
-| 512    | 5.18        | 2.26          | 0.44×           |
-| 1024   | 19.16       | 8.65          | 0.45×           |
-| 2048   | 34.16       | 17.76         | 0.52×           |
-| 4096   | 39.93       | 20.19         | 0.51×           |
-
-**The Triton kernel is ~2× slower than cuBLAS and that is the correct result.**
-
-cuBLAS closes the gap through techniques this kernel does not implement:
-- **Async double-buffering** (`cp.async` / `ldmatrix`): overlaps the global→shared load
-  of tile `t+1` with the matrix-multiply of tile `t`. Our kernel stalls on each load.
-- **`mma.sync` warp-level instructions**: cuBLAS emits Tensor Core ops directly via PTX;
-  `tl.dot` maps to Tensor Cores too, but with coarser layout control.
-- **Epilogue fusion**: cuBLAS fuses bias add, ReLU, etc. into the last write; our kernel
-  writes `C` in a plain store.
-
-The TFLOPS gap narrows at large sizes (39.93 vs 20.19 at 4096) because arithmetic
-intensity grows with matrix size and the pipeline stalls become proportionally cheaper.
-
-### Row-wise softmax — fp32, effective memory bandwidth (GB/s)
-
-| Shape        | torch.softmax | Triton kernel | Triton / PyTorch |
-|--------------|---------------|---------------|------------------|
-| (512, 512)   | 54            | 33            | 0.61×            |
-| (1024, 1024) | 163           | 122           | 0.75×            |
-| (2048, 2048) | 470           | 388           | 0.83×            |
-| (4096, 4096) | 452           | 393           | 0.87×            |
-| (8192, 4096) | 460           | 406           | 0.88×            |
-
-Softmax is memory-bandwidth bound; both implementations approach the hardware limit
-(~500 GB/s effective) at large sizes.  The gap at small shapes (512×512) is kernel-launch
-overhead: Triton's JIT compilation and runtime dispatch add fixed cost that dominates
-when the actual work is tiny.  At 8192×4096 the kernel is within 12% of PyTorch's
-cuDNN-backed implementation.
-
-## Design notes
-
-### Tiled matrix multiplication
-
-Naive GEMM reads each row of A and column of B K times from global memory.  Tiled GEMM
-loads 32×32 sub-tiles into shared memory (4–10 TB/s effective) and reuses them TILE_SIZE
-times, reducing global traffic by `TILE_SIZE`:
-
-```
-naive   global reads: 2 × M × N × K bytes
-tiled   global reads: M × N × K × (2 / TILE_SIZE) bytes
-```
-
-The Triton kernel adds L2-swizzled launch order (`GROUP_SIZE_M`) so that consecutive
-programs access overlapping B tiles and improve L2 hit rate.
-
-### Fused softmax
-
-Three passes (find max → compute exp-sum → normalize) require three global round-trips.
-The fused kernel performs a single pass: thread block finds its local max via warp shuffle
-(`__shfl_xor_sync`), reduces across the block via shared memory, then computes exp and
-sum in a second sweep of the same data that is still in registers.  Result: one read +
-one write instead of three reads + two writes.
-
-### Parallel reduction
-
-Two-phase design: phase 1 reduces BLOCK_SIZE-element tiles to per-block partial sums;
-phase 2 reduces the (much smaller) partial array.  For arrays fitting in one block,
-phase 2 is skipped.  Partials are always accumulated in float32 regardless of input
-dtype to prevent overflow on large float16 arrays.
-
-## What I learned
-
-- **Compute- vs bandwidth-bound**: matmul is compute-bound (arithmetic intensity ≫ 1),
-  softmax is bandwidth-bound (one exp per byte). Different bottlenecks need different
-  optimization strategies.
-- **Occupancy vs register pressure**: wider tiles improve arithmetic intensity but
-  increase register use and reduce SM occupancy. The 128×256×64 tile config was chosen
-  after profiling SM utilization with Nsight Compute.
-- **Warp divergence**: kept to zero by uniform control flow and aligned tile boundaries
-  with explicit masking rather than `if` branches.
-- **dtype tradeoffs**: fp16 halves memory traffic and hits Tensor Cores; accumulating in
-  fp32 avoids precision loss in the reduction tree.
-- **What cuBLAS actually does**: reading the CUTLASS source and PTX disassembly made the
-  gap between "correct" and "fast" concrete.
+- **Tile configuration decides matmul speed.** A fixed 128x256x64 tile with the default 4
+  warps reached only 10.6 TFLOPS at N = 4096 (0.16x cuBLAS), because each thread held too
+  large an accumulator and spilled registers. `triton.autotune` over 8 standard configs, with
+  4 or 8 warps and 3 to 5 pipeline stages, brings it to 69.3 TFLOPS.
+- **Block-wide reductions need two levels.** A warp shuffle reduces only 32 lanes. With 256
+  threads per row, both CUDA softmax kernels first kept one warp's partial result and dropped
+  the rest, so they disagreed with each other. They now reduce each warp, then reduce the
+  per-warp results, and match a double-precision CPU reference within 1e-8.
+- **The CUDA C++ matmul is a teaching kernel.** It uses fp32 on CUDA cores without tensor cores
+  (2.85 TFLOPS at N = 4096, against 2.14 for the naive kernel). The gap to cuBLAS is what
+  tensor cores, register tiling and async copies buy. The Triton kernel gets them through
+  `tl.dot` and software pipelining.
 
 ## References
 
-- [Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations](https://arxiv.org/abs/1912.10209)
-- [CUDA Programming Guide — Shared Memory](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory)
-- [Making Deep Learning Go Brrrr From First Principles](https://horace.io/brrr_intro.html)
-- [CUTLASS: Fast Linear Algebra in CUDA C++](https://github.com/NVIDIA/cutlass)
-- [Nsight Compute — Roofline Analysis](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html)
+- [Triton matrix multiplication tutorial](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html)
+- [Triton fused softmax tutorial](https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html)
+- [CUDA C++ Programming Guide: shared memory](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory)
+- [CUTLASS](https://github.com/NVIDIA/cutlass)

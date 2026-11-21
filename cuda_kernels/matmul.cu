@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 #include <cuda_runtime.h>
 
 #define TILE_SIZE 32

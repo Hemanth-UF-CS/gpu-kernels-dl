@@ -50,6 +50,35 @@ __device__ __forceinline__ float warpReduceSum(float val) {
 }
 
 
+// Block-wide reductions: reduce within each warp, then reduce the per-warp results in warp 0.
+// Every thread gets the block result. Requires blockDim.x to be a multiple of 32.
+__device__ float blockReduceMax(float val) {
+    __shared__ float warpVals[32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    val = warpReduceMax(val);
+    if (lane == 0) warpVals[warp] = val;
+    __syncthreads();
+    val = (threadIdx.x < blockDim.x / 32) ? warpVals[lane] : -FLT_MAX;
+    if (warp == 0) val = warpReduceMax(val);
+    if (threadIdx.x == 0) warpVals[0] = val;
+    __syncthreads();
+    return warpVals[0];
+}
+
+__device__ float blockReduceSum(float val) {
+    __shared__ float warpVals[32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    val = warpReduceSum(val);
+    if (lane == 0) warpVals[warp] = val;
+    __syncthreads();
+    val = (threadIdx.x < blockDim.x / 32) ? warpVals[lane] : 0.f;
+    if (warp == 0) val = warpReduceSum(val);
+    if (threadIdx.x == 0) warpVals[0] = val;
+    __syncthreads();
+    return warpVals[0];
+}
+
+
 // ---------------------------------------------------------------------------
 // Naive softmax: three global passes
 // ---------------------------------------------------------------------------
@@ -58,7 +87,7 @@ __global__ void rowMaxKernel(const float* x, float* rowMax, int cols) {
     float maxVal = -FLT_MAX;
     for (int j = threadIdx.x; j < cols; j += blockDim.x)
         maxVal = fmaxf(maxVal, x[row * cols + j]);
-    maxVal = warpReduceMax(maxVal);
+    maxVal = blockReduceMax(maxVal);
     if (threadIdx.x == 0) rowMax[row] = maxVal;
 }
 
@@ -72,7 +101,7 @@ __global__ void expSumKernel(const float* x, const float* rowMax,
         y[row * cols + j] = e;
         s += e;
     }
-    s = warpReduceSum(s);
+    s = blockReduceSum(s);
     if (threadIdx.x == 0) rowSum[row] = s;
 }
 
@@ -85,13 +114,12 @@ __global__ void divKernel(float* y, const float* rowSum, int cols) {
 
 
 // ---------------------------------------------------------------------------
-// Fused softmax: single pass using shared memory
-// Each block handles one row; assumes cols <= blockDim.x * 4
+// Fused softmax: one kernel per row (max, exp-sum and normalize without extra launches).
+// Each block handles one row; blockDim.x must be a multiple of 32.
 // ---------------------------------------------------------------------------
 __global__ void fusedSoftmaxKernel(const float* __restrict__ x,
                                     float* __restrict__ y,
                                     int cols) {
-    extern __shared__ float smem[];
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int blockSize = blockDim.x;
@@ -101,21 +129,7 @@ __global__ void fusedSoftmaxKernel(const float* __restrict__ x,
     for (int j = tid; j < cols; j += blockSize)
         maxVal = fmaxf(maxVal, x[row * cols + j]);
 
-    // Reduce max across all threads in block
-    smem[tid] = maxVal;
-    __syncthreads();
-    for (int stride = blockSize / 2; stride > 32; stride >>= 1) {
-        if (tid < stride) smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
-        __syncthreads();
-    }
-    // Warp-level final reduce
-    if (tid < 32) {
-        float val = smem[tid];
-        val = warpReduceMax(val);
-        if (tid == 0) smem[0] = val;
-    }
-    __syncthreads();
-    maxVal = smem[0];
+    maxVal = blockReduceMax(maxVal);
 
     // 2. Compute exp(x - max) and partial sum
     float sumVal = 0.f;
@@ -125,20 +139,7 @@ __global__ void fusedSoftmaxKernel(const float* __restrict__ x,
         sumVal += e;
     }
 
-    // Reduce sum across block
-    smem[tid] = sumVal;
-    __syncthreads();
-    for (int stride = blockSize / 2; stride > 32; stride >>= 1) {
-        if (tid < stride) smem[tid] += smem[tid + stride];
-        __syncthreads();
-    }
-    if (tid < 32) {
-        float val = smem[tid];
-        val = warpReduceSum(val);
-        if (tid == 0) smem[0] = val;
-    }
-    __syncthreads();
-    sumVal = smem[0];
+    sumVal = blockReduceSum(sumVal);
 
     // 3. Normalize
     for (int j = tid; j < cols; j += blockSize)
@@ -192,7 +193,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&dRowSum, rows * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(dX, hX, sz, cudaMemcpyHostToDevice));
 
-    int threads = min(cols, 256);
+    int threads = 256;  // multiple of 32, required by the block reductions
 
     // --- Naive (3-pass) ---
     auto runNaive = [&]() {
@@ -204,24 +205,34 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(hY_naive, dY, sz, cudaMemcpyDeviceToHost));
 
     // --- Fused (1-pass) ---
-    size_t sharedMem = threads * sizeof(float);
     auto runFused = [&]() {
-        fusedSoftmaxKernel<<<rows, threads, sharedMem>>>(dX, dY, cols);
+        fusedSoftmaxKernel<<<rows, threads>>>(dX, dY, cols);
     };
     float fusedMs = timeKernel(runFused);
     CUDA_CHECK(cudaMemcpy(hY_fused, dY, sz, cudaMemcpyDeviceToHost));
 
-    // Validation
-    float maxErr = 0.f;
-    for (int i = 0; i < rows * cols; ++i)
-        maxErr = fmaxf(maxErr, fabsf(hY_naive[i] - hY_fused[i]));
+    // Validation against a CPU reference (double precision)
+    float errNaive = 0.f, errFused = 0.f;
+    for (int r = 0; r < rows; ++r) {
+        const float* xr = hX + (size_t)r * cols;
+        double m = xr[0];
+        for (int j = 1; j < cols; ++j) m = fmax(m, (double)xr[j]);
+        double sum = 0.0;
+        for (int j = 0; j < cols; ++j) sum += exp((double)xr[j] - m);
+        for (int j = 0; j < cols; ++j) {
+            float ref = (float)(exp((double)xr[j] - m) / sum);
+            size_t i = (size_t)r * cols + j;
+            errNaive = fmaxf(errNaive, fabsf(hY_naive[i] - ref));
+            errFused = fmaxf(errFused, fabsf(hY_fused[i] - ref));
+        }
+    }
 
     printf("\n--- Results ---\n");
     printf("Naive softmax (3-pass): %7.3f ms\n", naiveMs);
     printf("Fused softmax (1-pass): %7.3f ms\n", fusedMs);
     printf("Speedup                : %.2fx\n", naiveMs / fusedMs);
-    printf("Max error (naive vs fused): %.4e  %s\n",
-           maxErr, maxErr < 1e-5f ? "PASS" : "FAIL");
+    printf("Max abs error vs CPU   : naive %.2e, fused %.2e  %s\n", errNaive, errFused,
+           (errNaive < 1e-6f && errFused < 1e-6f) ? "PASS" : "FAIL");
 
     double bandwidth = 2.0 * sz / (fusedMs * 1e-3) / 1e9;
     printf("Fused effective bandwidth: %.1f GB/s\n", bandwidth);

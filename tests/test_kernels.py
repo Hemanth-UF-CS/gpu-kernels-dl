@@ -156,15 +156,17 @@ class TestReduction:
 
     @CUDA
     def test_sum_fp16_no_overflow(self):
-        """Verify the dtype fix: fp16 sum should not overflow for large N."""
+        """fp16 input is accumulated in fp32, so precision is kept for large N.
+
+        65,536 x 0.5 = 32,768 is exactly representable in fp16, but an fp16 running sum
+        stalls once the spacing between fp16 values exceeds 0.5 (around 2,048).
+        """
         *_, triton_sum, triton_max, triton_mean, _ = _import_kernels()
-        n = 1 << 20
+        n = 1 << 16
         x = torch.full((n,), 0.5, device="cuda", dtype=torch.float16)
         result = triton_sum(x)
-        expected = 0.5 * n
-        # Before the fix this overflowed to 65504 (fp16 max); after the fix it's correct
-        assert abs(result.item() - expected) / expected < 0.01, \
-            f"Expected ~{expected}, got {result.item()} (possible fp16 overflow)"
+        assert result.dtype == torch.float16
+        assert result.item() == 0.5 * n
 
     @CUDA
     @pytest.mark.parametrize("n", [1024, 1 << 16, 1 << 20])

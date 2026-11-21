@@ -5,6 +5,7 @@ Reports latency (ms), effective memory bandwidth (GB/s), and speedup.
 """
 
 from __future__ import annotations
+import argparse
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import triton
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from triton_kernels.softmax import triton_softmax
+from benchmarks import record
 
 WARMUP = 5
 REPS = 100
@@ -38,11 +40,12 @@ def time_fn(fn, warmup: int = WARMUP, reps: int = REPS) -> float:
     return start.elapsed_time(end) / reps
 
 
-def run_benchmark(shapes: list[tuple[int, int]]) -> None:
+def run_benchmark(shapes: list[tuple[int, int]]) -> list[dict]:
     print(f"{'Shape':>14}  {'torch ms':>10}  {'triton ms':>10}  "
           f"{'torch GB/s':>12}  {'triton GB/s':>12}  {'speedup':>8}")
     print("-" * 72)
 
+    out = []
     for rows, cols in shapes:
         x = torch.randn(rows, cols, dtype=torch.float32, device="cuda")
 
@@ -55,9 +58,15 @@ def run_benchmark(shapes: list[tuple[int, int]]) -> None:
 
         print(f"{str((rows, cols)):>14}  {torch_ms:>10.3f}  {triton_ms:>10.3f}  "
               f"{torch_bw:>12.1f}  {triton_bw:>12.1f}  {speedup:>8.2f}x")
+        out.append({"rows": rows, "cols": cols, "torch_ms": torch_ms, "triton_ms": triton_ms,
+                    "torch_gbs": torch_bw, "triton_gbs": triton_bw})
+    return out
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", default="results/softmax.json")
+    args = parser.parse_args()
     if not torch.cuda.is_available():
         print("CUDA not available — cannot benchmark GPU kernels")
         return
@@ -72,7 +81,7 @@ def main():
         (4096, 4096),
         (8192, 4096),
     ]
-    run_benchmark(shapes)
+    record.write(args.out, run_benchmark(shapes))
 
 
 if __name__ == "__main__":

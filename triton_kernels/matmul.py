@@ -1,7 +1,8 @@
 """
 Tiled matrix multiplication in Triton.
 
-Implements the classic blocked GEMM algorithm with configurable tile sizes.
+Implements the classic blocked GEMM algorithm; tile sizes, pipeline depth and warp count
+are picked per problem shape by ``triton.autotune``.
 Validates numerically against torch.matmul and benchmarks against it.
 
 Reference: Triton GEMM tutorial
@@ -17,6 +18,29 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
+def _configs() -> list[triton.Config]:
+    """Tile shapes from the Triton GEMM tutorial; autotune picks one per (M, N, K)."""
+    shapes = [
+        (128, 256, 64, 3, 8),
+        (64, 256, 32, 4, 4),
+        (128, 128, 32, 4, 4),
+        (128, 64, 32, 4, 4),
+        (64, 128, 32, 4, 4),
+        (128, 32, 32, 4, 4),
+        (64, 32, 32, 5, 2),
+        (32, 64, 32, 5, 2),
+    ]
+    return [
+        triton.Config(
+            {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_SIZE_M": 8},
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm, bn, bk, stages, warps in shapes
+    ]
+
+
+@triton.autotune(configs=_configs(), key=["M", "N", "K"])
 @triton.jit
 def matmul_kernel(
     A_ptr, B_ptr, C_ptr,
@@ -73,14 +97,7 @@ def matmul_kernel(
 # ---------------------------------------------------------------------------
 # Python wrapper
 # ---------------------------------------------------------------------------
-def triton_matmul(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    block_m: int = 128,
-    block_n: int = 256,
-    block_k: int = 64,
-    group_size_m: int = 8,
-) -> torch.Tensor:
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     Compute C = A @ B using the Triton tiled kernel.
 
@@ -108,10 +125,6 @@ def triton_matmul(
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        GROUP_SIZE_M=group_size_m,
     )
     return c
 

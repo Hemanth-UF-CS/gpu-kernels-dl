@@ -1,5 +1,6 @@
 NVCC    = nvcc
-ARCH    = sm_80   # Change to sm_86 for RTX 30xx, sm_89 for RTX 40xx
+# Override per GPU: make ARCH=sm_86 (RTX 30xx), sm_89 (RTX 40xx), sm_80 (A100)
+ARCH   ?= sm_86
 CFLAGS  = -O3 -arch=$(ARCH) -std=c++17 -Xcompiler -Wall
 
 all: matmul softmax
